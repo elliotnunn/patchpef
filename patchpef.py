@@ -161,7 +161,7 @@ def asm(code):
     with tempfile.NamedTemporaryFile() as f:
         output_tmp = f.name
 
-    run(['vasmppc_std', '-Fbin', '-o', output_tmp, input_tmp], check=True, stdout=DEVNULL)
+    run(['vasmppc_mot', '-Fbin', '-spaces', '-o', output_tmp, input_tmp], check=True, stdout=DEVNULL)
 
     with open(output_tmp, 'rb') as f:
         return f.read()
@@ -227,49 +227,66 @@ def parse_location(locstr, locdict):
 
         yield func_name + suffix, final
 
-def blstring(s):
-    try:
-        s = s.encode('ascii')
-    except AttributeError:
-        pass
-
-    s += b'^n'
-
-    s = s + bytes(1)
-    while len(s) % 4 != 0:
-        s = s + bytes(1)
-
-    bl = (18 << 26) | ((len(s) + 4) & 0x3FFFFFC) | 1
-    s = bl.to_bytes(4, byteorder='big') + s
-
-    return s
-
 MACROS = """
-.macro _save
-    stw     r0, -128(sp)
-    stw     r2, -124(sp)
-    stmw    r3, -120(sp)
+    macro s
+    stmw    r0, -128(sp)
     mflr    r0
     stw     r0, -132(sp)
-.endm
+    endm
 
-.macro _restore
+    macro r
     lwz     r0, -132(sp)
     mtlr    r0
-    lmw     r3, -120(sp)
-    lwz     r2, -124(sp)
+    lmw     r3, -116(sp)
+    lwz     r2, -120(sp)
     lwz     r0, -128(sp)
-.endm
+    endm
 
-.macro _logname
-    _bl_my_name
+    MACRO flush
+    bl      \\@
+    DC.B    "^b"
+    DC.B    0
+    ALIGN   2
+\\@
     mflr    r3
     li      r0, 96
     sc
-.endm
+    ENDM
+
+    MACRO log
+    bl      \\@
+    DC.B    \\1
+    DC.B    0
+    ALIGN   2
+\\@
+    mflr    r3
+    li      r0, 96
+    sc
+    ENDM
+
+    MACRO logln
+    bl      \\@
+    DC.B    \\1
+    DC.B    "^n"
+    DC.B    0
+    ALIGN   2
+\\@
+    mflr    r3
+    li      r0, 96
+    sc
+    ENDM
+
+    MACRO logreg
+    lwz     r3, \\1*4-128(sp)
+    li      r4, 3
+    li      r0, 97
+    sc
+    ENDM
 
 
 """
+
+# print(MACROS)
 
 me, src, dest, *cmds = argv
 
@@ -285,17 +302,33 @@ for c in cmds:
     for name, offset in parse_location(c, locdict):
         print(name, hex(offset))
 
-        mylines = []
-        mylines.append('# Auto-generated assembly for pef patching')
-        mylines.append('.macro _bl_my_name')
-        mylines.append('.byte ' + ', '.join(hex(x) for x in blstring(name)))
-        mylines.append('.endm')
+        if c2.startswith('nop'):
+            for i in range(offset, offset + eval(c2[3:]), 4):
+                p.code[i:i+4] = b'\x60\x00\x00\x00'
+                continue
 
-        #mylines.append('.equ _name "%s"' % name)
-        # do something about function index here!
+        mylines = []
 
         mylines.append(MACROS)
-        mylines.extend(c2.split(';'))
+
+        if c2.startswith(':'):
+            mylines.append(' s')
+
+            c2 = c2[1:]
+
+            if re.match(r'^r\d+$', c2):
+                mylines.append(' log "%s: %s = "' % (name, c2))
+                mylines.append(' logreg %d' % int(c2[1:]))
+                mylines.append(' logln ""')
+            else:
+                s = name
+                if c2:
+                    s += ': ' + c2
+                mylines.append(' logln "%s"' % s)
+
+            mylines.append(' r')
+        else:
+            mylines.extend(c2.split(';'))
 
 
         a = asm('\n'.join(mylines))
