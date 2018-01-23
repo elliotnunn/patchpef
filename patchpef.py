@@ -3,11 +3,81 @@
 # REQUIRES VASM!
 
 import struct
-from subprocess import run, DEVNULL
+from subprocess import run, DEVNULL, PIPE
 import tempfile
 from collections import namedtuple
 import re
 from sys import argv
+
+def read_rsrc_path(path):
+    BADCHARS = b'\t$" '
+
+    if '//' not in path:
+        with open(path, 'rb') as f:
+            return f.read()
+
+    else:
+        path, _, rest = path.partition('//')
+
+        rtype, rid, *_ = rest.split('/')
+
+        try:
+            int(rid)
+        except ValueError:
+            rid = '"%s"' % rid
+
+        type_expr = '\'%s\' (%s)' % (rtype, rid)
+
+        rez_code = run(['DeRez', '-only', type_expr, path], stdout=PIPE, check=True).stdout
+
+        if len(rez_code) < 2:
+            raise FileNotFoundError
+
+        accum = bytearray()
+
+        for l in rez_code.split(b'\n'):
+            if len(l) >= 6 and l[1:2] == b'$':
+                hx = l[:43].lstrip(BADCHARS).rstrip(BADCHARS)
+                accum.extend(bytes.fromhex(hx.decode('ascii')))
+
+        return bytes(accum)
+
+def write_rsrc_path(path, data):
+    STEP = 32
+
+    if '//' not in path:
+        with open(path, 'wb') as f:
+            f.write(data)
+
+    else:
+        path, _, rest = path.partition('//')
+
+        rtype, rid, *args = rest.split('/')
+        if args:
+            rname = ', "%s"' % args[0]
+            args = args[1:]
+        else:
+            rname = ""
+        rid = int(rid)
+
+        args = ''.join(', %s' % x for x in args)
+
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            print('data \'%s\' (%d%s%s) {\n' % (rtype, rid, rname, args), file=f)
+
+            for o in range(0, len(data), STEP):
+                chunk = data[o:o+STEP].hex()
+                print('\t$"%s"' % chunk, file=f)
+
+            print('};', file=f)
+
+            f.flush()
+
+            run(['Rez', '-a', '-o', path, f.name], check=True)
+
+
+ILEN = 4 # length and alignment of PowerPC instruction
 
 class PEF:
     MAGIC = b'Joy!'
@@ -290,7 +360,7 @@ MACROS = """
 
 me, src, dest, *cmds = argv
 
-p = PEF.read_from(src)
+p = PEF(read_rsrc_path(src))
 
 locdict = {n: (o, l) for (o, l, n) in scan_symbols(p.code)}
 
@@ -338,4 +408,4 @@ for c in cmds:
         except:
             pass
 
-p.write_to(dest)
+write_rsrc_path(dest, bytes(p))
