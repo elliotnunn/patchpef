@@ -1,0 +1,17 @@
+The Preferred Executable Format (PEF) was introduced with the first
+Power Macs as the container format for PowerPC code. Almost all PowerPC
+code in the classic Mac OS is in PEF containers. (PEF containers were
+also used by BeOS for PowerPC, and occasionally by Mac OS X. Apple also
+adapted them to include 68k code for the "CMF-68k" runtime environment,
+but this feature was rarely used.)
+
+Patchpef lets you make small changes to the code section of a PEF
+container.
+
+Vasm with the "mot" syntax module ("vasmppc_mot") is required to
+assemble code.
+
+Syntax: patchpef.py <input> <output> <offset1> <code1> ...
+
+Examples:
+patchpef.py DataForkPEF USB.rsrc//nlib/-20777/USBFamilyExpertLib 0x1030 :'initing USB expert' 0x11B0 :'done initing USB' 0x10C8 :'about to call function (will log return)' 0x10CC :r3
