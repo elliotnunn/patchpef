@@ -8,221 +8,88 @@ import tempfile
 from collections import namedtuple
 import re
 from sys import argv
-
-def read_rsrc_path(path):
-    BADCHARS = b'\t$" '
-
-    if '//' not in path:
-        with open(path, 'rb') as f:
-            return f.read()
-
-    else:
-        path, _, rest = path.partition('//')
-
-        rtype, rid, *_ = rest.split('/')
-
-        try:
-            int(rid)
-        except ValueError:
-            rid = '"%s"' % rid
-
-        type_expr = '\'%s\' (%s)' % (rtype, rid)
-
-        rez_code = run(['DeRez', '-only', type_expr, path], stdout=PIPE, check=True).stdout
-
-        if len(rez_code) < 2:
-            raise FileNotFoundError
-
-        accum = bytearray()
-
-        for l in rez_code.split(b'\n'):
-            if len(l) >= 6 and l[1:2] == b'$':
-                hx = l[:43].lstrip(BADCHARS).rstrip(BADCHARS)
-                accum.extend(bytes.fromhex(hx.decode('ascii')))
-
-        return bytes(accum)
-
-def write_rsrc_path(path, data):
-    STEP = 32
-
-    if '//' not in path:
-        with open(path, 'wb') as f:
-            f.write(data)
-
-    else:
-        path, _, rest = path.partition('//')
-
-        rtype, rid, *args = rest.split('/')
-        if args:
-            rname = ', "%s"' % args[0]
-            args = args[1:]
-        else:
-            rname = ""
-        rid = int(rid)
-
-        args = ''.join(', %s' % x for x in args)
-
-
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            print('data \'%s\' (%d%s%s) {\n' % (rtype, rid, rname, args), file=f)
-
-            for o in range(0, len(data), STEP):
-                chunk = data[o:o+STEP].hex()
-                print('\t$"%s"' % chunk, file=f)
-
-            print('};', file=f)
-
-            f.flush()
-
-            run(['Rez', '-a', '-o', path, f.name], check=True)
-
+from macresources import read_rsrc_path, write_rsrc_path
+from pefbinary import PEF
 
 ILEN = 4 # length and alignment of PowerPC instruction
+IMASK = 0xFFFFFFFF
+XTOC = b'\x81\x82\xff\xff\x90\x41\x00\x14\x80\x0c\x00\x00\x80\x4c\x00\x04\x7c\x09\x03\xa6\x4e\x80\x04\x20'
 
-class PEF:
-    MAGIC = b'Joy!'
-    
-    CONT_HEAD_FMT = '>4s4s4s5I2HI'
-    CONT_HEAD_LEN = struct.calcsize(CONT_HEAD_FMT)
-    
-    SEC_HEAD_FMT = '>i5I4B'
-    SEC_HED_LEN = struct.calcsize(SEC_HEAD_FMT)
+def insn_to_int(insn):
+    if len(insn) != ILEN:
+        raise ValueError('bad insn len')
+    return int.from_bytes(insn, byteorder='big')
 
-    @classmethod
-    def read_from(cls, path):
-        with open(path, 'rb') as f:
-            return cls(f.read())
+def int_to_code(*the_ints): # can sneakily take multiple ints
+    return b''.join(x.to_bytes(4, byteorder='big') for x in the_ints)
 
-    def __init__(self, data):
-        (magic, fourcc, arch, ver,
-        timestamp, old_def_ver, old_imp_ver, cur_ver,
-        sec_count, inst_sec_count, reserv) = struct.unpack_from(self.CONT_HEAD_FMT, data)
+def make_branch(from_offset=None, to_offset=None, delta=None):
+    """Assemble an unconditional relative branch instruction"""
 
-        sec_earliest = len(data)
-        sec_latest = 0
+    if delta is None:
+        delta = to_offset - from_offset
 
-        self.sections = []
-        self.sectypes = []
-        self.headeroffsets = []
+    if not -(2**26) <= delta < 2**26:
+        raise ValueError('branch out of range')
 
-        self.code = None
+    if delta % 4:
+        raise ValueError('branch not aligned')
 
-        for i in range(sec_count):
-            sh_offset = self.CONT_HEAD_LEN + self.SEC_HED_LEN*i
-
-            (sectionName, sectionAddress, execSize,
-            initSize, rawSize, containerOffset,
-            regionKind, shareKind, alignment, reserved) = struct.unpack_from(self.SEC_HEAD_FMT, data, sh_offset)
-
-            the_sec = data[containerOffset : containerOffset + rawSize]
-
-            if regionKind == 0 and execSize == initSize == rawSize:
-                the_sec = bytearray(the_sec)
-                self.code = the_sec
-
-            self.sections.append(the_sec)
-            self.sectypes.append(regionKind)
-            self.headeroffsets.append(sh_offset)
-
-            sec_earliest = min(sec_earliest, containerOffset)
-            sec_latest = max(sec_latest, containerOffset + rawSize)
-
-        if sec_latest < len(data):
-            print('too short', hex(sec_latest), hex(len(data)))
-
-        self.header = data[:sec_earliest]
-
-    def __bytes__(self):
-        accum = bytearray(self.header)
-
-        for i in range(len(self.sections)):
-            the_sec = self.sections[i]
-            hoff = self.headeroffsets[i]
-
-            while len(accum) % 16:
-                accum.append(0)
-
-            new_off = len(accum)
-            new_len = len(the_sec)
-
-            accum.extend(the_sec)
-
-            struct.pack_into('>I', accum, hoff + 20, new_off)
-
-            if the_sec is self.code:
-                for i in range(8, 20, 4):
-                    struct.pack_into('>I', accum, hoff + i, new_len)
-
-        return bytes(accum)
-
-    def write_to(self, path):
-        with open(path, 'wb') as f:
-            f.write(bytes(self))
-
-def insert_branch(bin, from_offset=None, to_offset=None):
-    maxdel = 0x2000000
-
-    if from_offset is None: from_offset = len(bin)
-    if to_offset is None: to_offset = len(bin)
-
-    while len(bin) < from_offset + 4:
-        bin.append(0)
-
-    if from_offset & 3 or to_offset & 3:
-        raise ValueError('not aligned')
-
-    delta = to_offset - from_offset
-    
     insn = (18 << 26) | (delta & 0x3FFFFFC)
-    struct.pack_into('>I', bin, from_offset, insn)
 
-def clean_code(code):
-    """Accept single in, array of bytes, array of long ints, etc"""
+    return int_to_code(insn)
 
-    try:
-        code.decode
-    except AttributeError:
-        pass
+def adjust_branch(insn, orig_loc=None, new_loc=None, delta=None):
+    if delta is None:
+        delta = orig_loc - new_loc # seems backwards but isnt
+
+    as_int = insn_to_int(insn)
+    major_opcode = as_int >> 26
+
+    if major_opcode == 18:
+        offset_bit_count = 26
+    elif major_opcode == 16:
+        offset_bit_count = 16
     else:
-        return code
+        return insn
 
-    try:
-        iter(code)
-    except TypeError:
-        code = [code]
+    if as_int & 2:
+        return insn # absolute branch (these are rare)
 
-    code = list(code)
+    offset_mask = (1 << offset_bit_count) - 1
+    offset_mask &= ~3 # cut off two low flag bits
 
-    if len(code) % 4 == 0 and not any(x > 255 for x in code):
-        return bytes(code)
+    keep_mask = IMASK ^ offset_mask
 
-    return b''.join(x.to_bytes(4, byteorder='big') for x in code)
+    most_extreme_offset = 1 << (offset_bit_count - 1)
 
-def is_branch(code):
-    code = clean_code(code)
+    the_offset_bits = as_int & offset_mask
 
-    if len(code) != 4:
-        raise NotImplementedError('only implemented for single instructions')
+    the_offset = the_offset_bits
+    if the_offset & (1 << (offset_bit_count - 1)):
+        the_offset -= 1 << offset_bit_count
 
-    opcode = code[0] >> 2
+    the_new_offset = the_offset + delta
 
-    return opcode in [16, 18]
+    # print('-------- old_offset', hex(the_offset), 'new_offset', hex(the_new_offset))
 
+    if not -most_extreme_offset <= the_new_offset < most_extreme_offset:
+        raise ValueError('does not fit')
 
-def patch(bin, offset, code):
-    code = clean_code(code)
+    new_offset_bits = the_new_offset & offset_mask
 
-    rescued = p.code[offset : offset+4]
-    if is_branch(rescued):
-        raise NotImplementedError('cannot patch immediately before a branch')
+    new_as_int = (as_int & keep_mask) | new_offset_bits
 
-    # patch at the site
-    insert_branch(p.code, from_offset=offset, to_offset=len(p.code))
+    return int_to_code(new_as_int)
 
-    # and add the new code
-    p.code.extend(code)
-    p.code.extend(rescued)
-    insert_branch(p.code, to_offset=offset+4)
+def insn_can_fall_through(insn):
+    as_int = insn_to_int(insn)
+    if as_int in [0x4e800020, 0x4e800420, 0x4c000064]:
+        return False
+    elif as_int >> 26 == 18 and not as_int & 1:
+        return False
+    else:
+        return True
 
 def asm(code):
     with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
@@ -236,7 +103,7 @@ def asm(code):
     with open(output_tmp, 'rb') as f:
         return f.read()
 
-def scan_symbols(bin):
+def scan_ppc_macsbug_symbols(bin):
     last_one_ended_at = 0
 
     for i in range(0, len(bin), 4):
@@ -263,7 +130,7 @@ def scan_symbols(bin):
 
         yield func_start, func_len, name.decode('ascii')
 
-def parse_location(locstr, locdict):
+def offsets_from_command_str(locstr, locdict):
     suffix = ''
 
     if '+' in locstr:
@@ -297,20 +164,141 @@ def parse_location(locstr, locdict):
 
         yield func_name + suffix, final
 
+def uproot_instruction(insn, orig_loc, new_loc):
+    """The instruction might get expanded to three instructions!"""
+
+    BC_MASK = 0xFFFF0003
+    B = 0x48000000
+
+    as_int = insn_to_int(insn)
+
+    major_opcode = as_int >> 26
+    is_abs = bool(as_int & 2)
+    is_link = bool(as_int & 1)
+
+    if as_int == 0x4e800020:
+        print('---- single blr')
+        return insn
+
+    elif as_int == 0x4e800420:
+        print('---- single bctr')
+        return insn
+
+    elif as_int == 0x4c000064:
+        print('---- single rfi')
+        return insn
+
+    elif major_opcode == 18: # branch unconditional
+        print('---- unconditional branch')
+        new = insn
+
+        if not is_abs:
+            print('------ is pc-relative, adjusting...')
+            new = adjust_branch(new, orig_loc=orig_loc, new_loc=new_loc)
+        else:
+            print('------ is absolute, not adjusting')
+
+        if is_link:
+            print('------ is linking (bl), appending branch back home')
+            new += make_branch(from_offset=new_loc+4, to_offset=orig_loc+4)
+        else:
+            print('------ is non-linking')
+
+        return new
+
+    elif major_opcode == 16: # branch conditional
+        print('---- conditional branch')
+        new = insn
+
+        try:
+            new = adjust_branch(new, orig_loc=orig_loc, new_loc=new_loc)
+
+        except ValueError: #does not fit!
+            orig_bc_delta = as_int & (IMASK ^ BC_MASK)
+            if orig_bc_delta & 0x8000: orig_bc_delta =- 0x10000
+            print('------ is beyond adjustment range => "bc *+8; b back_home; b target"')
+
+            new = int_to_code((as_int & BC_MASK) | 8)
+            new += make_branch(from_offset=new_loc+4, to_offset=orig_loc+4)
+            new += make_branch(from_offset=new_loc+8, to_offset=orig_loc+orig_bc_delta)
+
+        else: # does fit!
+            print('------ is within adjustment range => "bc target; b back_home"')
+            new += make_branch(from_offset=new_loc+4, to_offset=orig_loc+4)
+
+        return new
+
+    else:
+        print('---- non-special-case %08X, assuming fallthrough' % as_int)
+
+        go_home = make_branch(from_offset=new_loc+4, to_offset=orig_loc+4)
+
+        return insn + go_home
+
+
 MACROS = """
-    macro s
+    macro saveRegsInRedZone
     stmw    r0, -128(sp)
     mflr    r0
     stw     r0, -132(sp)
     endm
 
-    macro r
+    macro s
+    saveRegsInRedZone
+    endm
+
+    macro restoreRegsFromRedZone
     lwz     r0, -132(sp)
     mtlr    r0
     lmw     r3, -116(sp)
     lwz     r2, -120(sp)
     lwz     r0, -128(sp)
     endm
+
+    macro r
+    restoreRegsFromRedZone
+    endm
+
+    MACRO saveRTOC
+    stw     r2, 20(sp)
+    ENDM
+
+    MACRO sr
+    saveRTOC
+    ENDM
+
+    MACRO restoreRTOC
+    lwz     r2, 20(sp)
+    ENDM
+
+    MACRO rr
+    restoreRTOC
+    ENDM
+
+    MACRO prolog
+framesize set \\1
+    mflr    r0
+    stw     r0, 8(sp)
+    stwu    sp, -framesize(sp)
+    IF amReplacingCrossTocGlue
+    stw     r2, framesize+20(sp)
+    ENDIF
+    ENDM
+
+    MACRO p
+    prolog \\1
+    ENDM
+
+    MACRO epilog
+    lwz     sp, framesize(sp)
+    lwz     r0, 8(sp)
+    mtlr    r0
+    blr
+    ENDM
+
+    MACRO e
+    epilog
+    ENDM
 
     MACRO flush
     bl      \\@
@@ -362,26 +350,56 @@ me, src, dest, *cmds = argv
 
 p = PEF(read_rsrc_path(src))
 
-locdict = {n: (o, l) for (o, l, n) in scan_symbols(p.code)}
+locdict = {n: (o, l) for (o, l, n) in scan_ppc_macsbug_symbols(p.code)}
 
 cmds = iter(cmds)
 
 for c in cmds:
-    c2 = next(cmds)
+    ccc = next(cmds)
 
-    for name, offset in parse_location(c, locdict):
-        print(name, hex(offset))
+    for name, offset in offsets_from_command_str(c, locdict):
+        c2 = ccc
+
+        print('Patching "%s" @ %X' % (name, offset))
 
         if c2.startswith('nop'):
             for i in range(offset, offset + eval(c2[3:]), 4):
                 p.code[i:i+4] = b'\x60\x00\x00\x00'
                 continue
 
+        am_replacing_xtoc_glue = False
+        if len(p.code) >= offset + len(XTOC):
+            xtoc = p.code[offset:offset+len(XTOC)]
+            if xtoc[:2] == XTOC[:2] and xtoc[4:] == XTOC[4:]:
+                print('-- patching over standard cross-TOC call glue:')
+                print('     prolog/p macro will save RTOC to caller linkage area')
+                print('     original glue is available using "xtoc" label')
+                am_replacing_xtoc_glue = True
+
+
         mylines = []
+
+        mylines.append('amReplacingCrossTocGlue equ %d' % am_replacing_xtoc_glue)
 
         mylines.append(MACROS)
 
+        for n, (o, l) in locdict.items():
+            mylines.append('%s equ $%X' % (n, o))
+
+        mylines.append('comefrom equ $%X' % offset)
+        mylines.append(' org $%X' % len(p.code))
+
+        # reinsert clean cross-toc glue because the user probably wants to make a tail patch
+        if am_replacing_xtoc_glue:
+            if 'xtoc' in c2:
+                print('---- inserting "xtoc" before your code')
+                mylines.append('xtoc equ $%X' % len(p.code))
+                p.code.extend(xtoc)
+            else:
+                print('---- no need to insert "xtoc"')
+
         if c2.startswith(':'):
+            # Code auto-gen commands start with colon: :r3, :string
             mylines.append(' s')
 
             c2 = c2[1:]
@@ -398,14 +416,28 @@ for c in cmds:
 
             mylines.append(' r')
         else:
+            # Otherwise, feed the assembler directly
             mylines.extend(c2.split(';'))
 
 
         a = asm('\n'.join(mylines))
 
-        try:
-            patch(p.code, offset, a)
-        except:
-            pass
+        # for l in mylines:
+        #     print(l)
+
+        to_rescue = p.code[offset:offset+ILEN]
+
+        get_here = make_branch(from_offset=offset, to_offset=len(p.code))
+        p.code[offset:offset+ILEN] = get_here
+
+        p.code.extend(a)
+
+        if len(a) >= ILEN and insn_can_fall_through(a[-ILEN:]):
+            print('-- your code falls through: appending their code')
+            rescued = uproot_instruction(to_rescue, offset, len(p.code))
+            p.code.extend(rescued)
+        else:
+            print('-- your code does not fall through: not appending anything')
+
 
 write_rsrc_path(dest, bytes(p))
