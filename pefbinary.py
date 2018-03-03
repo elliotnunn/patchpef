@@ -48,8 +48,12 @@ class PEF:
             sec_earliest = min(sec_earliest, containerOffset)
             sec_latest = max(sec_latest, containerOffset + rawSize)
 
-        if sec_latest < len(data):
-            print('too short', hex(sec_latest), hex(len(data)))
+        if any(data[sec_latest:]):
+            print('nonzero trailing data from', hex(sec_latest), 'to', hex(len(data)), ' ... will cause incorrect output')
+
+        self.padmult = 1
+        while len(data) % (self.padmult * 2) == 0:
+            self.padmult *= 2
 
         self.header = data[:sec_earliest]
 
@@ -73,6 +77,9 @@ class PEF:
             if the_sec is self.code:
                 for i in range(8, 20, 4):
                     struct.pack_into('>I', accum, hoff + i, new_len)
+
+        while len(accum) % self.padmult != 0:
+            accum.extend(b'\x00')
 
         return bytes(accum)
 
