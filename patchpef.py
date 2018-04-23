@@ -355,6 +355,9 @@ locdict = {n: (o, l) for (o, l, n) in scan_ppc_macsbug_symbols(p.code)}
 cmds = iter(cmds)
 
 for c in cmds:
+    while len(p.code) % 4:
+        p.code.append(0)
+
     ccc = next(cmds)
 
     for name, offset in offsets_from_command_str(c, locdict):
