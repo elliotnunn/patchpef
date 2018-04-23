@@ -407,7 +407,17 @@ for c in cmds:
 
             c2 = c2[1:]
 
-            if re.match(r'^r\d+$', c2):
+            if re.match(r'^:r\d+$', c2):
+                the_reg = int(c2[2:])
+                mylines.append(' log "%s: r%d => "' % (name, the_reg))
+                mylines.append(' lwz r5, %d(sp)' % (the_reg * 4 - 128))
+                mylines.append(' li r4, 4')
+                mylines.append(' li r0, 97')
+                for i in range(0, 32, 4):
+                    mylines.append(' lwz r3, %d(r5)' % i)
+                    mylines.append(' sc')
+                mylines.append(' logln ""')
+            elif re.match(r'^r\d+$', c2):
                 mylines.append(' log "%s: %s = "' % (name, c2))
                 mylines.append(' logreg %d' % int(c2[1:]))
                 mylines.append(' logln ""')
